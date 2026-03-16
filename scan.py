@@ -99,16 +99,13 @@ def is_fully_deletable(path, dir_info, cache):
     return has_content
 
 
-def write_delete_list(start_path, dir_info, cache, writer):
+def write_delete_list(start_path, dir_info, cache, writer, stats):
     """Write optimized CSV rows, streaming as we go."""
-    dir_count = 0
-    file_count = 0
 
     def walk(path):
-        nonlocal dir_count, file_count
         if is_fully_deletable(path, dir_info, cache):
             writer.writerow(("dir", path))
-            dir_count += 1
+            stats.add_delete_dir()
             return
 
         info = dir_info.get(path)
@@ -117,7 +114,7 @@ def write_delete_list(start_path, dir_info, cache, writer):
 
         for file_path in info["old_file_paths"]:
             writer.writerow(("file", file_path))
-            file_count += 1
+            stats.add_delete_file()
 
         for sub in info["subdirs"]:
             walk(sub)
@@ -126,11 +123,9 @@ def write_delete_list(start_path, dir_info, cache, writer):
     if info:
         for file_path in info.get("old_file_paths", []):
             writer.writerow(("file", file_path))
-            file_count += 1
+            stats.add_delete_file()
         for sub in info.get("subdirs", []):
             walk(sub)
-
-    return dir_count, file_count
 
 
 def main():
@@ -169,10 +164,9 @@ def main():
     with open(args.output, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(("type", "path"))
-        dir_count, file_count = write_delete_list(args.path, dir_info, cache, writer)
+        write_delete_list(args.path, dir_info, cache, writer, stats)
 
-    log.info("Wrote %d entries to %s (%d dirs, %d files)",
-             dir_count + file_count, args.output, dir_count, file_count)
+    log.info("To delete: %d dirs, %d files", stats.delete_dirs, stats.delete_files)
 
 
 if __name__ == "__main__":

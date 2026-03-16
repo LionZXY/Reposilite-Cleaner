@@ -98,17 +98,21 @@ class Stats:
         self.errors = 0
         self.skipped = 0
         self.empty_dirs = 0
+        self.delete_dirs = 0
+        self.delete_files = 0
         self.start_time = time.time()
 
     def _inc(self, attr, val=1):
         with self._lock:
             setattr(self, attr, getattr(self, attr) + val)
 
-    def add_request(self):    self._inc("requests")
-    def add_deleted(self):    self._inc("deleted")
-    def add_error(self):      self._inc("errors")
-    def add_skipped(self):    self._inc("skipped")
-    def add_empty_dir(self):  self._inc("empty_dirs")
+    def add_request(self):     self._inc("requests")
+    def add_deleted(self):     self._inc("deleted")
+    def add_error(self):       self._inc("errors")
+    def add_skipped(self):     self._inc("skipped")
+    def add_empty_dir(self):   self._inc("empty_dirs")
+    def add_delete_dir(self):  self._inc("delete_dirs")
+    def add_delete_file(self): self._inc("delete_files")
 
     def add_scanned(self, size):
         with self._lock:
@@ -150,4 +154,6 @@ class Stats:
         log.info("  Deleted:             %d", self.deleted)
         log.info("  Errors:              %d", self.errors)
         log.info("  Skipped (excluded):  %d", self.skipped)
+        log.info("  To delete (dirs):    %d", self.delete_dirs)
+        log.info("  To delete (files):   %d", self.delete_files)
         log.info("  Empty dirs removed:  %d", self.empty_dirs)
