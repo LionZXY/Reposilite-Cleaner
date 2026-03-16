@@ -42,6 +42,7 @@ def make_request(url, method="GET", token=None):
     req = urllib.request.Request(url, method=method)
     req.add_header("User-Agent", "reposilite-cleaner/1.0")
     if token:
+        token = token.strip()
         if method == "DELETE":
             credentials = base64.b64encode(token.encode()).decode()
             req.add_header("Authorization", "Basic " + credentials)
