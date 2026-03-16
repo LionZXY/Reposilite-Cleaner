@@ -1,0 +1,91 @@
+name: Clean Reposilite
+
+on:
+  schedule:
+    - cron: "0 3 * * 0" # Every Sunday at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: "Delete artifacts older than N days"
+        default: "30"
+        type: string
+
+jobs:
+  scan:
+    name: "Scan: ${{ matrix.repo }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: [releases, snapshots]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan for old artifacts
+        env:
+          REPOSILITE_TOKEN: ${{ secrets.REPOSILITE_TOKEN }}
+        run: |
+          python scan.py \
+            --repo ${{ matrix.repo }} \
+            --max-age-days ${{ github.event.inputs.max_age_days || '30' }} \
+            --output scan_result.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ matrix.repo }}
+          path: scan_result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-scan-${{ matrix.repo }}
+          path: clean.log
+
+  delete:
+    name: "Delete: ${{ matrix.repo }}"
+    needs: scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: [releases, snapshots]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: scan-${{ matrix.repo }}
+      - name: Delete old artifacts
+        env:
+          REPOSILITE_TOKEN: ${{ secrets.REPOSILITE_TOKEN }}
+        run: python delete.py --input scan_result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-delete-${{ matrix.repo }}
+          path: clean.log
+
+  cleanup:
+    name: "Cleanup: ${{ matrix.repo }}"
+    needs: delete
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: [releases, snapshots]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Remove empty directories
+        env:
+          REPOSILITE_TOKEN: ${{ secrets.REPOSILITE_TOKEN }}
+        run: python cleanup.py --repo ${{ matrix.repo }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-cleanup-${{ matrix.repo }}
+          path: clean.log
