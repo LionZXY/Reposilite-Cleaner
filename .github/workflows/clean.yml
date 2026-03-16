@@ -30,16 +30,11 @@ jobs:
           python scan.py \
             --repo ${{ matrix.repo }} \
             --max-age-days ${{ github.event.inputs.max_age_days || '30' }} \
-            --output scan_result.json
+            --output scan_result.csv
       - uses: actions/upload-artifact@v4
         with:
           name: scan-${{ matrix.repo }}
-          path: scan_result.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: log-scan-${{ matrix.repo }}
-          path: clean.log
+          path: scan_result.csv
 
   delete:
     name: "Delete: ${{ matrix.repo }}"
@@ -60,12 +55,7 @@ jobs:
       - name: Delete old artifacts
         env:
           REPOSILITE_TOKEN: ${{ secrets.REPOSILITE_TOKEN }}
-        run: python delete.py --input scan_result.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: log-delete-${{ matrix.repo }}
-          path: clean.log
+        run: python delete.py --repo ${{ matrix.repo }} --input scan_result.csv
 
   cleanup:
     name: "Cleanup: ${{ matrix.repo }}"
@@ -84,8 +74,3 @@ jobs:
         env:
           REPOSILITE_TOKEN: ${{ secrets.REPOSILITE_TOKEN }}
         run: python cleanup.py --repo ${{ matrix.repo }}
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: log-cleanup-${{ matrix.repo }}
-          path: clean.log

@@ -7,7 +7,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common import (
-    DEFAULT_EXCLUDE_FILE, DEFAULT_LOG_FILE, DEFAULT_URL, DEFAULT_WORKERS,
+    DEFAULT_EXCLUDE_FILE, DEFAULT_URL, DEFAULT_WORKERS,
     Stats, delete_path, is_excluded, list_details,
     load_exclude_file, log, set_stats, setup_logging,
 )
@@ -62,14 +62,13 @@ def main():
     p = argparse.ArgumentParser(description="Remove empty directories from Reposilite")
     p.add_argument("--url", default=DEFAULT_URL)
     p.add_argument("--token", default=os.environ.get("REPOSILITE_TOKEN"))
-    p.add_argument("--repo", required=True, help="Repository to clean")
+    p.add_argument("--repo", required=True)
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--path", default="")
     p.add_argument("--exclude-file", default=DEFAULT_EXCLUDE_FILE)
-    p.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     args = p.parse_args()
 
-    setup_logging(args.log_file)
+    setup_logging()
 
     if not args.token:
         log.error("--token or REPOSILITE_TOKEN is required")

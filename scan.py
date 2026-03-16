@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Scan repository and output optimized delete list.
+"""Scan repository and output optimized delete list as CSV.
 
-If all files in a directory are old, emits a single directory delete
-instead of individual file deletes.
+Streams rows to the output file as directories are processed,
+keeping memory usage low. If all files in a directory are old,
+emits a single directory delete instead of individual file deletes.
+
+Output CSV columns: type,path
 """
 
 import argparse
-import json
+import csv
 import os
 import sys
 import time
@@ -14,7 +17,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common import (
-    DEFAULT_EXCLUDE_FILE, DEFAULT_LOG_FILE, DEFAULT_URL, DEFAULT_WORKERS,
+    DEFAULT_EXCLUDE_FILE, DEFAULT_URL, DEFAULT_WORKERS,
     Stats, fmt_size, is_excluded, list_details,
     load_exclude_file, log, set_stats, setup_logging,
 )
@@ -25,7 +28,6 @@ DEFAULT_MAX_AGE_DAYS = 30
 def scan(base_url, repo, start_path, token, cutoff_ts, stats, exclude_paths, executor):
     """BFS scan. Returns per-directory metadata for optimization."""
     dirs_to_scan = [start_path]
-    # dir_path -> {total_files, old_files, subdirs, has_excluded}
     dir_info = defaultdict(lambda: {"total_files": 0, "old_files": 0, "old_file_paths": [], "subdirs": [], "has_excluded": False})
 
     while dirs_to_scan:
@@ -54,7 +56,6 @@ def scan(base_url, repo, start_path, token, cutoff_ts, stats, exclude_paths, exe
                 if entry["type"] == "DIRECTORY":
                     dirs_to_scan.append(entry_path)
                     dir_info[parent]["subdirs"].append(entry_path)
-                    # Ensure entry exists even if empty
                     _ = dir_info[entry_path]
                 elif entry["type"] == "FILE":
                     size = entry.get("contentLength", 0)
@@ -70,7 +71,6 @@ def scan(base_url, repo, start_path, token, cutoff_ts, stats, exclude_paths, exe
 
 
 def is_fully_deletable(path, dir_info, cache):
-    """Check if a directory and all its contents can be deleted as one."""
     if path in cache:
         return cache[path]
 
@@ -83,18 +83,15 @@ def is_fully_deletable(path, dir_info, cache):
         cache[path] = False
         return False
 
-    # All direct files must be old
     if info["old_files"] < info["total_files"]:
         cache[path] = False
         return False
 
-    # All subdirs must be fully deletable
     for sub in info["subdirs"]:
         if not is_fully_deletable(sub, dir_info, cache):
             cache[path] = False
             return False
 
-    # Must have at least some content (don't emit already-empty dirs)
     has_content = info["total_files"] > 0 or any(
         is_fully_deletable(s, dir_info, cache) for s in info["subdirs"]
     )
@@ -102,55 +99,53 @@ def is_fully_deletable(path, dir_info, cache):
     return has_content
 
 
-def build_delete_list(start_path, dir_info, cache):
-    """Build optimized list: directories where possible, files otherwise."""
-    entries = []
+def write_delete_list(start_path, dir_info, cache, writer):
+    """Write optimized CSV rows, streaming as we go."""
+    dir_count = 0
+    file_count = 0
 
     def walk(path):
+        nonlocal dir_count, file_count
         if is_fully_deletable(path, dir_info, cache):
-            entries.append({"type": "dir", "path": path})
+            writer.writerow(("dir", path))
+            dir_count += 1
             return
 
         info = dir_info.get(path)
         if info is None:
             return
 
-        # Add individual old files from this directory
         for file_path in info["old_file_paths"]:
-            entries.append({"type": "file", "path": file_path})
+            writer.writerow(("file", file_path))
+            file_count += 1
 
-        # Recurse into subdirs
         for sub in info["subdirs"]:
             walk(sub)
 
-    if start_path and start_path in dir_info:
-        walk(start_path)
-    else:
-        # Walk top-level subdirs from root
-        info = dir_info.get("", dir_info.get(start_path))
-        if info:
-            for file_path in info.get("old_file_paths", []):
-                entries.append({"type": "file", "path": file_path})
-            for sub in info.get("subdirs", []):
-                walk(sub)
+    info = dir_info.get(start_path, dir_info.get(""))
+    if info:
+        for file_path in info.get("old_file_paths", []):
+            writer.writerow(("file", file_path))
+            file_count += 1
+        for sub in info.get("subdirs", []):
+            walk(sub)
 
-    return entries
+    return dir_count, file_count
 
 
 def main():
     p = argparse.ArgumentParser(description="Scan Reposilite and list old artifacts")
     p.add_argument("--url", default=DEFAULT_URL)
     p.add_argument("--token", default=os.environ.get("REPOSILITE_TOKEN"))
-    p.add_argument("--repo", required=True, help="Repository to scan")
+    p.add_argument("--repo", required=True)
     p.add_argument("--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS)
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--path", default="")
     p.add_argument("--exclude-file", default=DEFAULT_EXCLUDE_FILE)
-    p.add_argument("--log-file", default=DEFAULT_LOG_FILE)
-    p.add_argument("--output", default="scan_result.json", help="Output JSON file")
+    p.add_argument("--output", default="scan_result.csv")
     args = p.parse_args()
 
-    setup_logging(args.log_file)
+    setup_logging()
 
     if not args.token:
         log.error("--token or REPOSILITE_TOKEN is required")
@@ -171,15 +166,13 @@ def main():
         stats.log_summary(args.repo)
 
     cache = {}
-    entries = build_delete_list(args.path, dir_info, cache)
+    with open(args.output, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(("type", "path"))
+        dir_count, file_count = write_delete_list(args.path, dir_info, cache, writer)
 
-    dir_count = sum(1 for e in entries if e["type"] == "dir")
-    file_count = sum(1 for e in entries if e["type"] == "file")
-
-    with open(args.output, "w") as f:
-        json.dump({"repo": args.repo, "entries": entries}, f)
-
-    log.info("Wrote %d entries to %s (%d dirs, %d files)", len(entries), args.output, dir_count, file_count)
+    log.info("Wrote %d entries to %s (%d dirs, %d files)",
+             dir_count + file_count, args.output, dir_count, file_count)
 
 
 if __name__ == "__main__":

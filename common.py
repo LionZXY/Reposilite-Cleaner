@@ -11,18 +11,17 @@ import urllib.error
 DEFAULT_URL = "https://reposilite.flipp.dev"
 DEFAULT_WORKERS = 8
 DEFAULT_EXCLUDE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exclude.txt")
-DEFAULT_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean.log")
 PROGRESS_INTERVAL = 60
 
 log = logging.getLogger("reposilite-cleaner")
 _stats_ref = None
 
 
-def setup_logging(log_file):
+def setup_logging():
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    for handler in (logging.StreamHandler(), logging.FileHandler(log_file, encoding="utf-8")):
-        handler.setFormatter(fmt)
-        log.addHandler(handler)
+    handler = logging.StreamHandler()
+    handler.setFormatter(fmt)
+    log.addHandler(handler)
     log.setLevel(logging.INFO)
 
 
