@@ -11,17 +11,21 @@ Authentication:
 """
 
 import argparse
+import base64
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
 import json
 import ssl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_MAX_AGE_DAYS = 30
 DEFAULT_REPOS = ["releases", "snapshots"]
+DEFAULT_WORKERS = 8
 DEFAULT_EXCLUDE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exclude.txt")
 DEFAULT_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean.log")
 
@@ -36,18 +40,21 @@ def load_exclude_file(path):
         return {line.strip() for line in f if line.strip() and not line.startswith("#")}
 
 
+_stats_ref = None
+
+
 def make_request(url, method="GET", token=None):
     req = urllib.request.Request(url, method=method)
     req.add_header("User-Agent", "reposilite-cleaner/1.0")
     if token:
         if method == "DELETE":
-            import base64
             credentials = base64.b64encode(token.encode()).decode()
             req.add_header("Authorization", "Basic " + credentials)
         else:
             req.add_header("Authorization", "Bearer " + token)
-    # Allow self-signed certs if needed
     ctx = ssl.create_default_context()
+    if _stats_ref:
+        _stats_ref.add_request()
     try:
         with urllib.request.urlopen(req, context=ctx) as resp:
             if method == "GET":
@@ -82,68 +89,147 @@ def is_excluded(repository, entry_path, exclude_paths):
 PROGRESS_INTERVAL = 60  # seconds
 
 
-def log_progress_if_needed(stats, repository):
-    now = time.time()
-    if now - stats["last_progress_time"] >= PROGRESS_INTERVAL:
-        elapsed = int(now - stats["start_time"])
-        log.info(
-            "PROGRESS [%s] %dm%02ds elapsed | scanned: %d files (%s) | old: %d | deleted: %d | errors: %d",
-            repository, elapsed // 60, elapsed % 60,
-            stats["total_files"], fmt_size(stats["total_size"]),
-            stats["old_files"], stats["deleted"], stats["errors"],
-        )
-        stats["last_progress_time"] = now
+class Stats:
+    """Thread-safe statistics counter."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.requests = 0
+        self.total_files = 0
+        self.total_size = 0
+        self.old_files = 0
+        self.old_size = 0
+        self.deleted = 0
+        self.errors = 0
+        self.skipped = 0
+        self.empty_dirs = 0
+        self.start_time = time.time()
+        self._last_progress_time = time.time()
+
+    def add_request(self):
+        with self._lock:
+            self.requests += 1
+
+    def add_scanned(self, size):
+        with self._lock:
+            self.total_files += 1
+            self.total_size += size
+
+    def add_old(self, size):
+        with self._lock:
+            self.old_files += 1
+            self.old_size += size
+
+    def add_deleted(self):
+        with self._lock:
+            self.deleted += 1
+
+    def add_error(self):
+        with self._lock:
+            self.errors += 1
+
+    def add_skipped(self):
+        with self._lock:
+            self.skipped += 1
+
+    def add_empty_dir(self):
+        with self._lock:
+            self.empty_dirs += 1
+
+    def log_progress(self, repository):
+        with self._lock:
+            elapsed = int(time.time() - self.start_time)
+            log.info(
+                "PROGRESS [%s] %dm%02ds elapsed | requests: %d | scanned: %d files (%s) | old: %d | deleted: %d | errors: %d",
+                repository, elapsed // 60, elapsed % 60,
+                self.requests, self.total_files, fmt_size(self.total_size),
+                self.old_files, self.deleted, self.errors,
+            )
+
+    def start_progress_timer(self, repository):
+        self._stop_event = threading.Event()
+        def _timer():
+            while not self._stop_event.wait(PROGRESS_INTERVAL):
+                self.log_progress(repository)
+        self._timer_thread = threading.Thread(target=_timer, daemon=True)
+        self._timer_thread.start()
+
+    def stop_progress_timer(self):
+        self._stop_event.set()
+        self._timer_thread.join()
 
 
-def walk_repository(base_url, repository, path, token, cutoff_ts, stats, exclude_paths):
-    """Recursively walk a repository and delete old artifacts."""
-    details = list_details(base_url, repository, path, token)
-    if details is None:
-        return
+def walk_repository(base_url, repository, start_path, token, cutoff_ts, stats, exclude_paths, executor):
+    """BFS walk: parallel directory listing + parallel file deletion."""
+    dirs_to_scan = [start_path]
+    all_visited_dirs = []
+    delete_futures = []
 
-    files = details.get("files", [])
-    for entry in files:
-        log_progress_if_needed(stats, repository)
-        name = entry["name"]
-        entry_path = f"{path}/{name}" if path else name
+    # Phase 1: BFS scan directories and delete old files
+    while dirs_to_scan:
+        # List all directories in current batch in parallel
+        future_to_path = {
+            executor.submit(list_details, base_url, repository, d, token): d
+            for d in dirs_to_scan
+        }
+        dirs_to_scan = []
 
-        if is_excluded(repository, entry_path, exclude_paths):
-            log.info("SKIP (excluded): %s/%s", repository, entry_path)
-            stats["skipped"] += 1
-            continue
-
-        if entry["type"] == "DIRECTORY":
-            walk_repository(base_url, repository, entry_path, token, cutoff_ts, stats, exclude_paths)
-            # After cleaning children, re-check if directory is now completely empty
-            after = list_details(base_url, repository, entry_path, token)
-            if after is None:
-                # Directory already gone (deleted by Reposilite when last file removed)
+        for future in as_completed(future_to_path):
+            path = future_to_path[future]
+            details = future.result()
+            if details is None:
                 continue
-            remaining = after.get("files", None)
-            if remaining is not None and len(remaining) == 0:
-                stats["empty_dirs"] += 1
-                log.info("DELETE empty dir: %s/%s", repository, entry_path)
-                try:
-                    delete_file(base_url, repository, entry_path, token)
-                except Exception as e:
-                    log.error("Failed to delete dir %s/%s: %s", repository, entry_path, e)
-        elif entry["type"] == "FILE":
-            last_modified = entry.get("lastModifiedTime", 0)
-            stats["total_files"] += 1
-            stats["total_size"] += entry.get("contentLength", 0)
 
-            if last_modified < cutoff_ts:
-                stats["old_files"] += 1
-                stats["old_size"] += entry.get("contentLength", 0)
-                age_days = (time.time() - last_modified) / 86400
+            for entry in details.get("files", []):
+                name = entry["name"]
+                entry_path = f"{path}/{name}" if path else name
 
-                log.info("DELETE %s/%s  (%dd old, %s)", repository, entry_path, age_days, fmt_size(entry.get('contentLength', 0)))
-                try:
-                    delete_file(base_url, repository, entry_path, token)
-                    stats["deleted"] += 1
-                except urllib.error.HTTPError as e:
-                    log.error("Failed to delete %s/%s: HTTP %d", repository, entry_path, e.code)
-                    stats["errors"] += 1
+                if is_excluded(repository, entry_path, exclude_paths):
+                    log.info("SKIP (excluded): %s/%s", repository, entry_path)
+                    stats.add_skipped()
+                    continue
+
+                if entry["type"] == "DIRECTORY":
+                    dirs_to_scan.append(entry_path)
+                    all_visited_dirs.append(entry_path)
+                elif entry["type"] == "FILE":
+                    content_length = entry.get("contentLength", 0)
+                    last_modified = entry.get("lastModifiedTime", 0)
+                    stats.add_scanned(content_length)
+
+                    if last_modified < cutoff_ts:
+                        stats.add_old(content_length)
+                        age_days = (time.time() - last_modified) / 86400
+                        log.info("DELETE %s/%s  (%dd old, %s)", repository, entry_path, age_days, fmt_size(content_length))
+                        f = executor.submit(_delete_file_task, base_url, repository, entry_path, token, stats)
+                        delete_futures.append(f)
+
+    # Wait for all file deletes to finish before checking empty dirs
+    for future in as_completed(delete_futures):
+        future.result()
+
+    # Phase 2: clean up empty directories (deepest first)
+    for dir_path in reversed(all_visited_dirs):
+        after = list_details(base_url, repository, dir_path, token)
+        if after is None:
+            continue
+        remaining = after.get("files", None)
+        if remaining is not None and len(remaining) == 0:
+            stats.add_empty_dir()
+            log.info("DELETE empty dir: %s/%s", repository, dir_path)
+            try:
+                delete_file(base_url, repository, dir_path, token)
+            except Exception as e:
+                log.error("Failed to delete dir %s/%s: %s", repository, dir_path, e)
+
+
+def _delete_file_task(base_url, repository, entry_path, token, stats):
+    try:
+        delete_file(base_url, repository, entry_path, token)
+        stats.add_deleted()
+    except urllib.error.HTTPError as e:
+        log.error("Failed to delete %s/%s: HTTP %d", repository, entry_path, e.code)
+        stats.add_error()
 
 
 def fmt_size(n):
@@ -164,6 +250,8 @@ def main():
                         help=f"Repositories to clean (default: {DEFAULT_REPOS})")
     parser.add_argument("--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS,
                         help=f"Delete artifacts older than this many days (default: {DEFAULT_MAX_AGE_DAYS})")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Number of parallel workers (default: {DEFAULT_WORKERS})")
     parser.add_argument("--path", default="",
                         help="Only clean under this subpath (e.g. 'net/flipper')")
     parser.add_argument("--exclude-file", default=DEFAULT_EXCLUDE_FILE,
@@ -196,28 +284,31 @@ def main():
     log.info("  Repositories: %s", args.repos)
     log.info("  Max age:      %d days", args.max_age_days)
     log.info("  Cutoff:       %s", time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cutoff_ts)))
+    log.info("  Workers:      %d", args.workers)
     exclude_paths = load_exclude_file(args.exclude_file)
     log.info("  Exclude file: %s (%d entries)", args.exclude_file, len(exclude_paths))
     log.info("  Log file:     %s", log_file)
 
-    for repo in args.repos:
-        log.info("Scanning %s/%s...", repo, args.path)
-        stats = {
-            "total_files": 0, "total_size": 0,
-            "old_files": 0, "old_size": 0,
-            "deleted": 0, "errors": 0, "skipped": 0, "empty_dirs": 0,
-            "start_time": time.time(), "last_progress_time": time.time(),
-        }
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        for repo in args.repos:
+            log.info("Scanning %s/%s...", repo, args.path)
+            global _stats_ref
+            stats = Stats()
+            _stats_ref = stats
+            stats.start_progress_timer(repo)
 
-        walk_repository(args.url, repo, args.path, args.token, cutoff_ts, stats, exclude_paths)
+            walk_repository(args.url, repo, args.path, args.token, cutoff_ts, stats, exclude_paths, executor)
 
-        log.info("%s summary:", repo)
-        log.info("  Total files scanned: %d (%s)", stats['total_files'], fmt_size(stats['total_size']))
-        log.info("  Old files found:     %d (%s)", stats['old_files'], fmt_size(stats['old_size']))
-        log.info("  Deleted:             %d", stats['deleted'])
-        log.info("  Errors:              %d", stats['errors'])
-        log.info("  Skipped (excluded):  %d", stats['skipped'])
-        log.info("  Empty dirs removed:  %d", stats['empty_dirs'])
+            stats.stop_progress_timer()
+
+            log.info("%s summary:", repo)
+            log.info("  HTTP requests:       %d", stats.requests)
+            log.info("  Total files scanned: %d (%s)", stats.total_files, fmt_size(stats.total_size))
+            log.info("  Old files found:     %d (%s)", stats.old_files, fmt_size(stats.old_size))
+            log.info("  Deleted:             %d", stats.deleted)
+            log.info("  Errors:              %d", stats.errors)
+            log.info("  Skipped (excluded):  %d", stats.skipped)
+            log.info("  Empty dirs removed:  %d", stats.empty_dirs)
 
 
 if __name__ == "__main__":
