@@ -30,11 +30,16 @@ jobs:
           python scan.py \
             --repo ${{ matrix.repo }} \
             --max-age-days ${{ github.event.inputs.max_age_days || '30' }} \
-            --output scan_result.csv
+            --output scan_result.csv \
+            --cleanup-output cleanup_dirs.csv
       - uses: actions/upload-artifact@v4
         with:
           name: scan-${{ matrix.repo }}
           path: scan_result.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-${{ matrix.repo }}
+          path: cleanup_dirs.csv
 
   delete:
     name: "Delete: ${{ matrix.repo }}"
@@ -59,7 +64,7 @@ jobs:
 
   cleanup:
     name: "Cleanup: ${{ matrix.repo }}"
-    needs: delete
+    needs: scan
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -70,7 +75,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: cleanup-${{ matrix.repo }}
       - name: Remove empty directories
         env:
           REPOSILITE_TOKEN: ${{ secrets.REPOSILITE_TOKEN }}
-        run: python cleanup.py --repo ${{ matrix.repo }}
+        run: python cleanup.py --repo ${{ matrix.repo }} --input cleanup_dirs.csv

@@ -99,6 +99,53 @@ def is_fully_deletable(path, dir_info, cache):
     return has_content
 
 
+def will_be_empty(path, dir_info, deletable_cache):
+    """Check if a dir will be empty after delete phase (but isn't fully deletable itself)."""
+    info = dir_info.get(path)
+    if info is None:
+        return False
+    # All direct files must be old
+    if info["old_files"] < info["total_files"]:
+        return False
+    # All subdirs must be either fully deletable or will themselves be empty
+    for sub in info["subdirs"]:
+        if not is_fully_deletable(sub, dir_info, deletable_cache) and not will_be_empty(sub, dir_info, deletable_cache):
+            return False
+    return True
+
+
+def find_cleanup_dirs(start_path, dir_info, deletable_cache):
+    """Find dirs that will be empty after delete phase but aren't in the delete list.
+
+    Returns paths deepest-first so they can be deleted in order.
+    """
+    result = []
+
+    def walk(path):
+        # If fully deletable, it's already in the delete list — skip it and its children
+        if is_fully_deletable(path, dir_info, deletable_cache):
+            return
+
+        info = dir_info.get(path)
+        if info is None:
+            return
+
+        # Recurse into subdirs first (we want deepest-first)
+        for sub in info["subdirs"]:
+            walk(sub)
+
+        # Check if this dir will be empty after deletions
+        if will_be_empty(path, dir_info, deletable_cache):
+            result.append(path)
+
+    info = dir_info.get(start_path, dir_info.get(""))
+    if info:
+        for sub in info.get("subdirs", []):
+            walk(sub)
+
+    return result
+
+
 def write_delete_list(start_path, dir_info, cache, writer, stats):
     """Write optimized CSV rows, streaming as we go."""
 
@@ -138,6 +185,7 @@ def main():
     p.add_argument("--path", default="")
     p.add_argument("--exclude-file", default=DEFAULT_EXCLUDE_FILE)
     p.add_argument("--output", default="scan_result.csv")
+    p.add_argument("--cleanup-output", default="cleanup_dirs.csv")
     args = p.parse_args()
 
     setup_logging()
@@ -167,6 +215,15 @@ def main():
         write_delete_list(args.path, dir_info, cache, writer, stats)
 
     log.info("To delete: %d dirs, %d files", stats.delete_dirs, stats.delete_files)
+
+    cleanup_dirs = find_cleanup_dirs(args.path, dir_info, cache)
+    with open(args.cleanup_output, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(("path",))
+        for d in cleanup_dirs:
+            writer.writerow((d,))
+
+    log.info("Cleanup dirs: %d (written to %s)", len(cleanup_dirs), args.cleanup_output)
 
 
 if __name__ == "__main__":
